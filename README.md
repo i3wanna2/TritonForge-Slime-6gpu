@@ -74,6 +74,29 @@ We did not change KernelBench rewards or GRPO math.
 
 ---
 
+## Results
+
+We successfully ran **Qwen3-8B KernelBook-SFT → multi-turn RL** on this 6-GPU borrow layout (cold start from SFT).
+
+Training metric: mean `rollout/raw_reward` per step (same signal upstream blogs use).
+
+| Window | Steps | Mean `raw_reward` |
+|--------|-------|-------------------|
+| Early | 0–9 | ~0.09 |
+| Mid | 50–59 | ~0.17 |
+| Later | 100–109 | ~0.22 |
+| Latest 10 | 131–140 | ~0.48 |
+
+At **step 140**: last step ≈ **0.47**, 10-step moving average ≈ **0.48**, peak step ≈ **0.59** (step 138). Still climbing; not a finished plateau.
+
+<p align="center">
+  <img src="docs/assets/results/qwen3-8b-multi-turn-6gpu-raw-reward.png" alt="Qwen3-8B multi-turn raw_reward on 6-GPU borrow" width="100%"/>
+</p>
+
+This is a **train-time reward curve**, not a held-out KernelBench Pass@1 table.
+
+---
+
 ## How to run
 
 ```bash
