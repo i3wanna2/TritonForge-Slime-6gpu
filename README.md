@@ -85,7 +85,7 @@ Training metric: mean `rollout/raw_reward` per step (same signal upstream blogs 
 | Early | 0–9 | ~0.09 |
 | Mid | 50–59 | ~0.17 |
 | Later | 100–109 | ~0.22 |
-| Latest 10 | 131–140 | ~0.48 |
+| Latest 10 | 131–140 | ~0.48 (still climbing) |
 
 <p align="center">
   <img src="docs/assets/results/qwen3-8b-multi-turn-6gpu-raw-reward.png" alt="Qwen3-8B multi-turn raw_reward on 6-GPU borrow" width="100%"/>
