@@ -76,7 +76,7 @@ We did not change KernelBench rewards or GRPO math.
 
 ## Results
 
-We successfully ran **Qwen3-8B KernelBook-SFT → multi-turn RL** on this 6-GPU borrow layout (cold start from SFT).
+We successfully ran **Qwen3-8B KernelBook-SFT → multi-turn RL** on this 6-GPU borrow layout (cold start from SFT). Wall time is **about one day** for ~140 steps on our machine (most of that is generate + KernelBench eval while train is asleep; Megatron steps are a smaller fraction).
 
 Training metric: mean `rollout/raw_reward` per step (same signal upstream blogs use).
 
