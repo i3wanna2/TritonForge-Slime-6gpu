@@ -1,4 +1,3 @@
-# TritonForge-Slime-6gpu
 
 Fork of [RLsys-Foundation/TritonForge](https://github.com/RLsys-Foundation/TritonForge)  
 (upstream SLIME based on [THUDM/slime](https://github.com/THUDM/slime)).
