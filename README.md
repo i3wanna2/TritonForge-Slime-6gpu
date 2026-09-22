@@ -51,6 +51,19 @@ Together: *keep a floor of exclusive eval GPUs, and opportunistically multiplex 
                     └─────────────────────────┘
 ```
 
+### Consequence: borrow can OOM — reserved is the safety lane (with jump-the-queue)
+
+Reserved is intentionally **small** (often one GPU). Borrowable cards are train cards after offload: free memory is good enough for many KernelBench jobs, but **not guaranteed** for large shapes or peak VRAM kernels. So borrow-first scoring will sometimes hit **CUDA OOM**.
+
+We treat that as expected, not fatal:
+
+1. **Default path** — try **borrowable** (or route obviously huge jobs straight to reserved).  
+2. **On CUDA OOM on a borrowable GPU** — do not fail the sample; **requeue onto the reserved path** (`reserved_queue`).  
+3. **Jump the queue (插队)** — OOM / large / `force_reserved` jobs get **higher priority** on the reserved worker so they are not stuck behind a long line of cheap borrowable-friendly jobs.  
+4. **OOM on reserved itself** — stop retrying; fail that sample (no second safety pool).
+
+So reserved is not only “always-on capacity,” it is also the **overflow lane** for work that borrowable could not hold. Without jump-the-queue, a single reserved GPU would become a FIFO bottleneck and OOM retries would wait forever behind normal traffic.
+
 That is the whole design thesis. The sections below are just how we instantiated it on six cards and which failure modes we had to harden.
 
 ---
@@ -94,6 +107,7 @@ borrow enable        → borrowable open again for next generate/score window
 
 | Failure mode | Mitigation |
 |--------------|------------|
+| Borrowable CUDA OOM / oversized shapes | Requeue to `reserved_queue` with **priority jump**; reserved OOM fails the sample |
 | Eval child still holds CUDA after “finished” | Immediate kill on disable + drain to enable-time VRAM baseline |
 | NCCL dies after CuMem wake | One-shot NCCL / grad-norm prewarm |
 | Train starts while borrow still live | Rollout pause file + `borrow_enabled` gate in eval server |
