@@ -3,104 +3,125 @@
 Fork of [RLsys-Foundation/TritonForge](https://github.com/RLsys-Foundation/TritonForge)  
 (upstream SLIME based on [THUDM/slime](https://github.com/THUDM/slime)).
 
-This repository documents a **limited-GPU redesign** of the TritonForge train / rollout / eval loop. Algorithm hyper-parameters stay close to the upstream NV multi-turn recipe; the changes are about **how GPUs are shared over time**.
+Algorithm hyper-parameters stay close to the upstream NV multi-turn recipe. This fork changes **how GPUs are owned over time**, not the RL objective.
 
 ---
 
-## Problem
+## Overview (our thinking)
 
-Upstream TritonForge is written for a layout where **train, SGLang rollout, and KernelBench eval each own dedicated GPUs** for the whole run (roughly an 8-GPU-class setup).
+### Starting point
 
-We only had **6 usable GPUs** on a shared node (and preferred to leave some cards untouched for other jobs). A naive shrink of parallel degrees or batch sizes would hurt training quality. We wanted to keep the **8B + multi-turn** recipe as intact as possible and still finish training.
+Upstream TritonForge assumes enough dedicated GPUs so that **train, rollout, and KernelBench eval can all stay resident**. On our machine we effectively needed an **~8-GPU** style footprint, but only had **6 GPUs we could use** (and we wanted to leave some cards free for other jobs). Shrinking TP/batch/length would change the recipe we cared about. So the question became: *can we keep the recipe and still run, by sharing cards smarter?*
 
----
+### What we noticed
 
-## Observation: the bottleneck was evaluation, not training
+Watching `nvidia-smi` during a run, the expensive phase was not Megatron steps — it was **KernelBench eval**. Eval wall time is long, but **GPU utilization is often near zero**: compile happens on CPU, processes wait, one kernel runs on one device while sibling eval GPUs sit idle. Meanwhile, if train GPUs are reserved exclusively “for Megatron later,” they also sit idle during generate+eval.
 
-Profiling the original disaggregated loop:
+So the real bottleneck was **eval throughput under a card budget**, not “training cannot start.” Card count was scarce; **duty cycle was wasteful**.
 
-1. **Generation (SGLang)** needs continuous GPU memory for the policy.
-2. **Training (Megatron)** needs a large burst of GPUs for TP/CP, then can sleep if offload is enabled.
-3. **Evaluation (KernelBench compile + run)** is the long pole. Each sample may compile and execute Triton kernels; wall time is high, but **instantaneous GPU utilization is often near zero** — most time is CPU-side compile, waiting on subprocesses, or a single kernel on one device while other eval GPUs sit idle.
+### Core idea: two kinds of eval GPU
 
-So the hardware picture was: during eval-heavy phases, **several GPUs that could help score kernels were idle**, while the train GPUs (if reserved exclusively) were also idle waiting for the next batch. Card count was the constraint; **utilization was not**.
+We stopped treating “eval GPUs” as one pool. We split them by **ownership policy**:
 
-That suggested a design where train GPUs are **borrowed for eval only when Megatron has offloaded**, instead of permanently dedicating enough cards for peak concurrency.
+| Kind | Role in the story | Rule |
+|------|-------------------|------|
+| **Reserved** | A small set of cards that **always belong to eval** | Eval can use them anytime. They never host Megatron. Guarantees progress even when train is awake. |
+| **Borrowable** | Cards that **primarily belong to training** | Eval may use them **only while Megatron is offloaded** (generate / score phase). Before train wakes, borrow must stop and VRAM must return. |
 
----
+Intuition:
 
-## Design
+- **Reserved** = baseline capacity so scoring never fully stalls.  
+- **Borrowable** = temporary surplus capacity harvested from idle train GPUs when utilization would otherwise be ~0.  
 
-### Goal
+Rollout (SGLang) stays on its own dedicated card(s): the policy must remain loaded for generation and should not fight eval or train for the same memory.
 
-Run an upstream-like multi-turn RL job on **6 physical GPUs** by time-sharing train and eval, without rewriting the reward or GRPO math.
-
-### Layout (example physical IDs)
-
-| Role | GPUs | Behavior |
-|------|------|----------|
-| Left alone | `0,1` | Shared node / other users |
-| Megatron actor | `2,3,4,5` | Full train when awake; **offload** during generate |
-| SGLang rollout | `6` | Dedicated inference |
-| Eval reserved | `7` | Always available for KernelBench |
-| Eval borrowable | `2,3,4,5` | Same as actor; only while Megatron is asleep |
-
-### Control loop
-
-Each training step is ordered so borrow never overlaps Megatron compute:
+Together: *keep a floor of exclusive eval GPUs, and opportunistically multiplex train GPUs into eval when training does not need them.*
 
 ```text
-generate (rollout)     → Megatron offloaded; eval may borrow 2–5 + use 7
-pause rollout
-borrow disable         → stop new evals; kill in-flight borrow workers; wait VRAM ≈ baseline
-wake Megatron + train  → exclusive use of 2–5
-borrow enable          → open eval again for next generate
+                    ┌─────────────────────────┐
+  generate + score  │  reserved  ✓ always     │
+                    │  borrowable ✓ if asleep │
+                    └─────────────────────────┘
+                              │
+                    clear borrow / restore VRAM
+                              │
+                    ┌─────────────────────────┐
+  Megatron train    │  borrowable ✗ locked    │
+                    │  reserved  ✓ still eval │
+                    └─────────────────────────┘
 ```
 
-### Engineering pieces that made this reliable
-
-| Issue seen in practice | Fix in this fork |
-|------------------------|------------------|
-| Eval children still hold CUDA memory after “done” | `/borrow/disable` **immediate kill** + drain until VRAM returns to the enable-time baseline |
-| NCCL collectives fail after CuMem wake | **NCCL / grad-norm prewarm** once after first wake |
-| Train starts while eval still occupies a train GPU | Rollout **pause file** + hard borrow gate in the eval server |
-| Resume vs cold start from SFT | Shared `lib_train_mode.sh` (`cold` / `resume` / `resume_weights`) |
-
-### What we deliberately did not change
-
-- KernelBench reward definition and GRPO training objective  
-- Claiming a new SOTA Pass@1 — this fork is an **infra** adaptation for scarce GPUs  
+That is the whole design thesis. The sections below are just how we instantiated it on six cards and which failure modes we had to harden.
 
 ---
 
-## How to run (this layout)
+## Problem (constraints)
+
+- Wanted upstream-like **8B multi-turn RL**, not a toy hyper-parameter shrink.  
+- Only **6 usable GPUs** on a shared node.  
+- Eval is slow and **under-utilizes** GPUs → opportunity to share.  
+- Train and borrowable eval **must not overlap** in memory or NCCL.
+
+---
+
+## Concrete layout (example)
+
+Physical IDs we used; adjust with env vars.
+
+| Role | GPUs | Policy |
+|------|------|--------|
+| Left alone | `0,1` | Other jobs / system |
+| Megatron actor | `2,3,4,5` | Train when awake; **offload** when generating → become **borrowable** |
+| SGLang rollout | `6` | Dedicated inference (not borrowed) |
+| Eval **reserved** | `7` | Always for KernelBench |
+| Eval **borrowable** | `2,3,4,5` | Same devices as actor; only when offloaded |
+
+---
+
+## Control loop
+
+Each step enforces the reserved / borrowable rule:
+
+```text
+generate (rollout)   → Megatron offloaded; eval uses reserved + may borrow
+pause rollout
+borrow disable       → no new evals on borrowable; kill in-flight borrow; VRAM ≈ baseline
+wake + train         → exclusive Megatron on borrowable set; reserved still eval-only
+borrow enable        → borrowable open again for next generate/score window
+```
+
+### Hardening (after the idea was clear)
+
+| Failure mode | Mitigation |
+|--------------|------------|
+| Eval child still holds CUDA after “finished” | Immediate kill on disable + drain to enable-time VRAM baseline |
+| NCCL dies after CuMem wake | One-shot NCCL / grad-norm prewarm |
+| Train starts while borrow still live | Rollout pause file + `borrow_enabled` gate in eval server |
+| Cold start vs resume | `lib_train_mode.sh` (`cold` / `resume` / `resume_weights`) |
+
+We did **not** change KernelBench rewards or GRPO math. This fork is infra for scarce GPUs.
+
+---
+
+## How to run
 
 ```bash
-# Multi-turn RL (default: cold start from SFT)
 bash SLIME/scripts/run_agent_kbench_qwen3_8B_sft_nv_multi_turn.sh
-
-# Single-turn
 bash SLIME/scripts/run_agent_kbench_qwen3_8B_sft_nv_single_turn.sh
-
-# Resume RL save
 TRAIN_MODE=resume bash SLIME/scripts/run_agent_kbench_qwen3_8B_sft_nv_multi_turn.sh
 ```
 
-Important env vars: `PROJECT_ROOT`, `TF_LOG_DIR`, `TRAIN_MODE`, `EVAL_BORROWABLE_DEVICES`, `EVAL_RESERVED_DEVICES`.
+Env: `PROJECT_ROOT`, `TF_LOG_DIR`, `TRAIN_MODE`, `EVAL_RESERVED_DEVICES`, `EVAL_BORROWABLE_DEVICES`.
 
-Core code paths:
+Code: `SLIME/train.py`, `SLIME/slime/ray/ppo_actor.py`, `KBenchEval/scripts/eval_server_subprocess.py`.
 
-- `SLIME/train.py` — pause / borrow / train orchestration  
-- `SLIME/slime/ray/ppo_actor.py` — offload + NCCL prewarm  
-- `KBenchEval/scripts/eval_server_subprocess.py` — borrow enable/disable and drain  
-
-For install, Docker, and model download, follow the [upstream TritonForge README](https://github.com/RLsys-Foundation/TritonForge).
+Install and model download: [upstream TritonForge](https://github.com/RLsys-Foundation/TritonForge).
 
 ---
 
-## Not in this git repo
+## Not in git
 
-`models/`, train logs, `rollout_data/`, wandb dumps, and `.venv` are gitignored (weights are 100GB+). Place HF / Megatron checkpoints under `models/` locally as upstream describes.
+`models/`, logs, `rollout_data/`, wandb, `.venv` are ignored (weights are 100GB+).
 
 ---
 
@@ -109,13 +130,13 @@ For install, Docker, and model download, follow the [upstream TritonForge README
 ```text
 THUDM/slime
   └── RLsys-Foundation/TritonForge
-        └── i3wanna2/TritonForge-Slime-6gpu   (this fork)
+        └── i3wanna2/TritonForge-Slime-6gpu
 ```
 
-Upstream license: Apache-2.0. Please cite / star upstream if you build on this work.
+Apache-2.0. Please cite / star upstream if you use this.
 
 ---
 
 ## Monitoring
 
-Prefer **`rollout/raw_reward`** (and a fixed KernelBench eval) over `train/loss`. Under GRPO, batch advantages are centered near zero by design, so loss is a poor stopping signal.
+Watch **`rollout/raw_reward`** (and fixed KernelBench eval), not `train/loss` — GRPO advantages are centered near zero by design.
