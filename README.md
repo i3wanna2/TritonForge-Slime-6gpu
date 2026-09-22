@@ -8,9 +8,9 @@ Same RL recipe as upstream. This fork is for running it when you do not have eno
 
 ## Overview
 
-Upstream wants train, rollout, and eval on **separate GPUs at the same time** (roughly an 8-GPU setup). We only had **6 usable GPUs**, and did not want to shrink batch / length / TP just to fit. Keeping a full-size actor still needs about **4 GPUs for training**, which would leave only **1 GPU for rollout and 1 for eval** — too slow for KernelBench scoring.
+Upstream wants train, rollout, and eval on **separate GPUs at the same time** (roughly an 8-GPU setup). We only had **6 usable GPUs**, and did not want to shrink batch / length / TP just to fit. Keeping a full-size actor must needs about **4 GPUs for training**, which would leave only **1 GPU for rollout and 1 for eval** — too slow for KernelBench scoring.
 
-Looking at the run, **eval was the bottleneck**, but eval GPUs were often near **0% utilization** (compile on CPU, waiting, one kernel on one card). Train GPUs were also idle while waiting for scores. Wasting cards, not “training too heavy.”
+Looking at the run, **eval was the bottleneck**, but eval GPUs were often near **0% utilization** (compile on CPU, waiting, one kernel on one card). Train GPUs were also idle while waiting for scores. 
 
 **Our idea is simple:**
 
