@@ -111,7 +111,11 @@ class Buffer:
         # Remove None values
         wandb_config = {k: v for k, v in wandb_config.items() if v is not None}
 
-        wandb.init(**wandb_config, settings=wandb.Settings(mode="shared"))
+        wandb_mode = os.environ.get("WANDB_MODE", "offline")
+        if wandb_mode in ("offline", "disabled"):
+            wandb.init(**wandb_config, mode=wandb_mode)
+        else:
+            wandb.init(**wandb_config, settings=wandb.Settings(mode="shared"))
 
     def get_samples(self, num_samples: int) -> list[list[Sample]]:
         """

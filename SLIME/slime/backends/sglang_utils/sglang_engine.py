@@ -26,17 +26,18 @@ class SglangEngine:
     def __init__(self, args, rank, dist_init_addr, port, nccl_port):
         self.args = args
 
-        # remove the CUDA_VISIBLE_DEVICES set by ray and use base_gpu_id
-        os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-
+        # Keep job CVD intact; base_gpu_id is the slot after actor GPUs (CVD index).
+        base = get_base_gpu_id(args, rank)
         nnodes = max(1, args.rollout_num_gpus_per_engine // 8)
         node_rank = rank % nnodes
         kwargs = {
             "model_path": args.hf_checkpoint,
             "trust_remote_code": True,
             "random_seed": args.seed + rank,
-            # memory
-            "enable_memory_saver": args.offload,
+            # memory: only colocate needs SGLang memory-saver sleep/wake.
+            # Disaggregated rollout sits on its own GPU; saver+sleep crashes
+            # (Triton "cpu tensor?" after resume) and is unnecessary for borrow.
+            "enable_memory_saver": bool(args.offload and getattr(args, "colocate", False)),
             # distributed
             "host": get_host_info()[1],
             "port": port,
@@ -45,7 +46,7 @@ class SglangEngine:
             "node_rank": node_rank,
             "dist_init_addr": dist_init_addr,
             "gpu_id_step": 1,
-            "base_gpu_id": get_base_gpu_id(args, rank),
+            "base_gpu_id": base,
             # parallel
             "tp_size": args.rollout_num_gpus_per_engine,
             "dp_size": args.sglang_dp_size,
@@ -53,6 +54,10 @@ class SglangEngine:
             "ep_size": args.sglang_ep_size,
             # always skip warmup to prevent warmup timeout.
             "skip_server_warmup": True,
+            # CUDA-graph capture frequently hangs after ~40% on this host;
+            # disable unless explicitly re-enabled.
+            "disable_cuda_graph": os.environ.get("SGLANG_ENABLE_CUDA_GRAPH", "").lower()
+            not in ("1", "true", "yes"),
         }
 
         unused_keys = set(kwargs.keys())

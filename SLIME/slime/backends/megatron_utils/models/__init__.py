@@ -14,7 +14,14 @@ from megatron.training import get_args
 from megatron.training.arguments import core_transformer_config_from_args
 
 
-def model_provider(pre_process=True, post_process=True) -> GPTModel:
+def model_provider(
+    pre_process=True,
+    post_process=True,
+    config=None,
+    pg_collection=None,
+    vp_stage=None,
+    **_unused,
+) -> GPTModel:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -30,8 +37,9 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     args = get_args()
     use_te = args.transformer_impl == "transformer_engine"
 
-    # Experimental loading arguments from yaml
-    config = core_transformer_config_from_args(args)
+    # Newer Megatron get_model() passes config/pg_collection/vp_stage; fall back to args.
+    if config is None:
+        config = core_transformer_config_from_args(args)
 
     if args.spec is not None:
         transformer_layer_spec = import_module(args.spec)
@@ -91,6 +99,10 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         "rotary_base": args.rotary_base,
         "rope_scaling": args.use_rope_scaling,
     }
+    if pg_collection is not None:
+        kwargs["pg_collection"] = pg_collection
+    if vp_stage is not None:
+        kwargs["vp_stage"] = vp_stage
 
     if getattr(args, "mtp_num_layers", None):
         from megatron.core.models.gpt.gpt_layer_specs import get_gpt_mtp_block_spec

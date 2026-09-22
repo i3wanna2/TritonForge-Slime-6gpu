@@ -54,17 +54,31 @@ def init_process_group(
 
     # NOTE: The pg_options parameter was renamed into backend_options in PyTorch 2.6.0
     # https://github.com/pytorch/pytorch/commit/a0c7029a75628cd5fa8df83c0de0ea98ee7fd844
-    # We need to determine the appropriate parameter name based on PyTorch version
-    pg_options_param_name = "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"
+    # Do NOT use str(torch.__version__) >= "2.6" — that breaks on 2.10+ (lexicographic).
+    import inspect
+
+    helper_params = inspect.signature(_new_process_group_helper).parameters
+    if "backend_options" in helper_params:
+        pg_options_param_name = "backend_options"
+    elif "pg_options" in helper_params:
+        pg_options_param_name = "pg_options"
+    else:
+        pg_options_param_name = None
+
+    helper_kwargs = {
+        "group_name": group_name,
+        "timeout": timeout,
+    }
+    if pg_options_param_name is not None:
+        helper_kwargs[pg_options_param_name] = pg_options
+
     pg, _ = _new_process_group_helper(
         world_size,
         rank,
         [],
         backend,
         store,
-        group_name=group_name,
-        **{pg_options_param_name: pg_options},
-        timeout=timeout,
+        **helper_kwargs,
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}

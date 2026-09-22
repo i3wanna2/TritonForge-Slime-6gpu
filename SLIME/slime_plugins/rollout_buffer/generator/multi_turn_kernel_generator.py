@@ -6,6 +6,7 @@ import time
 from datetime import datetime
 from functools import partial
 from multiprocessing import Process, Queue, Semaphore
+from queue import Empty
 from typing import Dict, List, Optional, Tuple
 
 from openai import OpenAI
@@ -15,11 +16,16 @@ from slime_plugins.rollout_buffer.generator.base_generator import BaseGenerator
 from slime_plugins.rollout_buffer.generator.kernel_generator import (
     DEFAULT_REMOTE_EVAL_SERVER_URL,
     EVAL_CONCURRENCY,
+    EVAL_RESERVED_GPU,
+    EVAL_WORKER_GPUS,
+    LARGE_SHAPE_BYTES,
     SAMPLING_PARAMS,
+    estimate_label_bytes,
     get_baseline_runtime,
     load_baseline_timings,
     query_llm_with_retry,
     submit_kernel_eval_request,
+    wait_if_rollout_paused,
 )
 from slime_plugins.rollout_buffer.generator.kernelbench_config import KERNELBENCH_REWARDS, KERNELBENCH_COT_SETTINGS
 from slime_plugins.rollout_buffer.generator.reward_utils.kernel_utils import extract_last_code, strip_thinking_tags
@@ -229,6 +235,76 @@ def calculate_aggregated_return(
     return aggregated_return
 
 
+def _submit_eval_with_pin(
+    eval_semaphore: Semaphore,
+    remote_eval_server_url: str,
+    eval_item: dict,
+    preferred_device: Optional[int],
+    backend: str = "triton",
+    baseline_timings: Optional[Dict] = None,
+    eval_route: Optional[Dict] = None,
+):
+    """Pin eval to a GPU; large shapes / OOM fall back to reserved (same as single-turn).
+
+    When eval_route is set (gen/eval split), hand the job to a pinned eval worker via
+    eval_queue/reserved_queue and wait on reply_queue — same STOP/EVAL_COMPLETE drain as single.
+    """
+    est = estimate_label_bytes(eval_item.get("label", "") or "")
+    if eval_route is not None:
+        import uuid as _uuid
+
+        reply_id = str(_uuid.uuid4())
+        payload = {
+            "eval_item": eval_item,
+            "backend": backend,
+            "baseline_timings": baseline_timings,
+            "_reply_id": reply_id,
+        }
+        if est >= LARGE_SHAPE_BYTES:
+            logger.info(f"Multi-turn large-shape est_bytes={est}; route reserved_queue")
+            eval_route["reserved_queue"].put(payload)
+        else:
+            eval_route["eval_queue"].put(payload)
+        reply_q = eval_route["reply_queue"]
+        while True:
+            wait_if_rollout_paused()
+            msg = reply_q.get()
+            if msg.get("_reply_id") == reply_id:
+                return msg["eval_result"]
+            # Shared reply bus: not ours — put back for the owning gen.
+            reply_q.put(msg)
+            time.sleep(0.01)
+
+    if est >= LARGE_SHAPE_BYTES:
+        devices = [EVAL_RESERVED_GPU]
+        logger.info(f"Multi-turn large-shape est_bytes={est}; prefer reserved={EVAL_RESERVED_GPU}")
+    elif preferred_device is not None:
+        devices = [preferred_device]
+        if preferred_device != EVAL_RESERVED_GPU:
+            devices.append(EVAL_RESERVED_GPU)
+    else:
+        devices = [None]
+
+    last = None
+    for i, device in enumerate(devices):
+        wait_if_rollout_paused()
+        last = submit_kernel_eval_request(
+            eval_semaphore,
+            remote_eval_server_url,
+            eval_item,
+            backend=backend,
+            baseline_timings=baseline_timings,
+            preferred_device=device,
+        )
+        if getattr(last, "eval_status", None) != "cuda_oom":
+            return last
+        if i + 1 < len(devices):
+            logger.warning(
+                f"Multi-turn CUDA OOM on device={device}; retry reserved/next={devices[i + 1]}"
+            )
+    return last
+
+
 def rollout_multi_turn_trajectory(
     item: dict,
     client: OpenAI,
@@ -240,6 +316,8 @@ def rollout_multi_turn_trajectory(
     gamma: float = DEFAULT_GAMMA,
     baseline_timings: Optional[Dict] = None,
     use_native_template: bool = True,
+    preferred_device: Optional[int] = None,
+    eval_route: Optional[Dict] = None,
 ) -> Tuple[List[dict], float, List[float], List[dict]]:
     """Execute multi-turn rollout for kernel generation.
 
@@ -253,6 +331,8 @@ def rollout_multi_turn_trajectory(
         max_turns: Maximum number of turns
         gamma: Discount factor for aggregated return
         baseline_timings: Baseline timing data for performance comparison
+        preferred_device: Physical GPU for eval (蹭卡 / reserved pin)
+        eval_route: Optional gen/eval split queues {eval_queue, reserved_queue, reply_queue}
 
     Returns:
         Tuple of (final_messages, aggregated_return, turn_rewards, history)
@@ -286,12 +366,14 @@ def rollout_multi_turn_trajectory(
         })
         eval_item["messages"] = eval_messages
         
-        eval_result = submit_kernel_eval_request(
+        eval_result = _submit_eval_with_pin(
             eval_semaphore,
             remote_eval_server_url,
             eval_item,
+            preferred_device=preferred_device,
             backend=backend,
             baseline_timings=baseline_timings,
+            eval_route=eval_route,
         )
         
         # Return kernel code, eval_result, and thinking content for logging
@@ -480,8 +562,11 @@ def rollout_multi_turn_trajectory(
     return messages, aggregated_return, turn_rewards, history
 
 
-def worker_process_multi_turn(
+def gen_worker_process_multi_turn(
     task_queue,
+    eval_queue,
+    reserved_queue,
+    reply_queue,
     done_queue,
     rollout_func,
     client,
@@ -492,13 +577,19 @@ def worker_process_multi_turn(
     max_turns,
     gamma,
 ):
-    """Worker process for multi-turn rollout."""
+    """Generate-only multi-turn worker: LLM + queue evals to pinned eval workers."""
+    logger.info("Multi-turn gen worker started")
+    eval_route = {
+        "eval_queue": eval_queue,
+        "reserved_queue": reserved_queue,
+        "reply_queue": reply_queue,
+    }
     while True:
+        wait_if_rollout_paused()
         item = task_queue.get()
         if item == "STOP":
             break
 
-        # Execute multi-turn rollout
         messages, aggregated_return, turn_rewards, history = rollout_func(
             item,
             client,
@@ -508,17 +599,17 @@ def worker_process_multi_turn(
             max_turns=max_turns,
             gamma=gamma,
             baseline_timings=baseline_timings,
+            preferred_device=None,  # routing handled by eval workers + large→reserved
+            eval_route=eval_route,
         )
 
-        # Prepare output item
         item["messages"] = messages
-        item["reward"] = aggregated_return  # Use aggregated return as final reward
+        item["reward"] = aggregated_return
         item["turn_rewards"] = turn_rewards
         item["history"] = history
         item["num_turns"] = len(turn_rewards)
         item["rollout_index"] = 1
 
-        # Add execution details from the last turn
         if history:
             last_turn = history[-1]
             execution_details = {
@@ -537,7 +628,6 @@ def worker_process_multi_turn(
                 "aggregated_return": 0,
             }
 
-        # Preserve original extra_info
         original_extra_info = item.get("extra_info", {})
         item.update(sampling_params)
         item["timestamp"] = str(time.time())
@@ -558,7 +648,6 @@ def worker_process_multi_turn(
             },
         }
 
-        # Save final trajectory data
         final_log_data = {
             "instance_id": output_item["instance_id"],
             "reward": aggregated_return,
@@ -571,17 +660,82 @@ def worker_process_multi_turn(
             "extra_info": original_extra_info,
         }
         save_multi_turn_data_to_local(final_log_data, is_final=True)
-
-        # Also preserve instance_id for output
         output_item["instance_id"] = final_log_data["instance_id"]
-
         done_queue.put(output_item)
 
-    done_queue.put("COMPLETE")
+    done_queue.put("GEN_COMPLETE")
+
+
+def eval_worker_process_multi_turn(
+    eval_queue,
+    reserved_queue,
+    reply_queue,
+    done_queue,
+    remote_eval_server_url,
+    eval_semaphore,
+    preferred_device: int,
+    reserved_gpu: int,
+    consume_reserved: bool,
+):
+    """Eval-only worker pinned to one physical GPU (mirrors single-turn drain)."""
+    logger.info(
+        f"Multi-turn eval worker started preferred_device={preferred_device} "
+        f"consume_reserved={consume_reserved} reserved_gpu={reserved_gpu}"
+    )
+    while True:
+        wait_if_rollout_paused()
+        item = None
+        from_reserved = False
+        if consume_reserved:
+            try:
+                item = reserved_queue.get_nowait()
+                from_reserved = True
+            except Empty:
+                try:
+                    item = eval_queue.get(timeout=0.2)
+                except Empty:
+                    continue
+        else:
+            item = eval_queue.get()
+
+        if item == "STOP":
+            if consume_reserved and not from_reserved:
+                eval_queue.put(item)
+                time.sleep(0.05)
+                continue
+            break
+
+        wait_if_rollout_paused()
+        reply_id = item["_reply_id"]
+        eval_item = item["eval_item"]
+        backend = item.get("backend", "triton")
+        baseline_timings = item.get("baseline_timings")
+
+        eval_result = submit_kernel_eval_request(
+            eval_semaphore,
+            remote_eval_server_url,
+            eval_item,
+            backend=backend,
+            baseline_timings=baseline_timings,
+            preferred_device=preferred_device,
+        )
+
+        if getattr(eval_result, "eval_status", None) == "cuda_oom":
+            if preferred_device != reserved_gpu and not consume_reserved:
+                logger.warning(
+                    f"Multi-turn CUDA OOM on phys={preferred_device}; requeue reserved_queue"
+                )
+                reserved_queue.put(item)
+                continue
+            logger.error(f"Multi-turn CUDA OOM on reserved phys={preferred_device}; fail sample")
+
+        reply_queue.put({"_reply_id": reply_id, "eval_result": eval_result})
+
+    done_queue.put("EVAL_COMPLETE")
 
 
 class MultiTurnKernelGenerator(BaseGenerator):
-    """Multi-turn trajectory generator for KernelBench."""
+    """Multi-turn trajectory generator for KernelBench (gen pool + pinned eval pool)."""
 
     def __init__(
         self,
@@ -617,7 +771,12 @@ class MultiTurnKernelGenerator(BaseGenerator):
         self.remote_eval_server_url = remote_eval_server_url
         self.eval_concurrency = eval_concurrency
         self.eval_semaphore = Semaphore(eval_concurrency)
-        self.task_queue, self.done_queue = Queue(maxsize=self.queue_size), Queue(maxsize=self.queue_size)
+        self.task_queue = Queue(maxsize=self.queue_size)
+        self.eval_queue = Queue(maxsize=self.queue_size)
+        self.reserved_queue = Queue(maxsize=self.queue_size)
+        # Shared reply bus inherited by gen+eval via Process args (not nested in eval_queue).
+        self.reply_queue = Queue(maxsize=self.queue_size)
+        self.done_queue = Queue(maxsize=self.queue_size)
 
         # Multi-turn parameters
         self.max_turns = max_turns
@@ -637,13 +796,38 @@ class MultiTurnKernelGenerator(BaseGenerator):
         logger.info(f"Multi-turn kernel generator initialized with max_turns={max_turns}, gamma={gamma}")
 
     def rollout_one_epoch(self, input_file, rollout_func):
-        """Execute one epoch of multi-turn rollout."""
-        processes = []
-        for _ in range(self.num_process):
+        """Execute one epoch of multi-turn rollout (gen/eval split like single-turn)."""
+        worker_gpus = list(EVAL_WORKER_GPUS) if EVAL_WORKER_GPUS else []
+        if not worker_gpus:
+            raise ValueError("EVAL_WORKER_GPUS is empty; need pinned eval GPUs")
+
+        reserved_gpu = EVAL_RESERVED_GPU
+        if reserved_gpu not in worker_gpus:
+            logger.warning(
+                f"EVAL_RESERVED_GPU={reserved_gpu} not in EVAL_WORKER_GPUS={worker_gpus}; "
+                f"OOM/large will have no reserved consumer"
+            )
+
+        num_gen = self.num_process
+        num_eval = len(worker_gpus)
+        borrowable_gpus = [g for g in worker_gpus if g != reserved_gpu]
+        num_borrowable = len(borrowable_gpus)
+        has_reserved_worker = reserved_gpu in worker_gpus
+
+        logger.info(
+            f"Multi-turn Scheme A: gen_workers={num_gen} eval_workers={num_eval} "
+            f"gpus={worker_gpus} reserved={reserved_gpu} borrowable={borrowable_gpus}"
+        )
+
+        gen_processes = []
+        for _ in range(num_gen):
             process = Process(
                 target=partial(
-                    worker_process_multi_turn,
+                    gen_worker_process_multi_turn,
                     self.task_queue,
+                    self.eval_queue,
+                    self.reserved_queue,
+                    self.reply_queue,
                     self.done_queue,
                     rollout_func,
                     self.client,
@@ -656,9 +840,28 @@ class MultiTurnKernelGenerator(BaseGenerator):
                 ),
             )
             process.start()
-            processes.append(process)
+            gen_processes.append(process)
 
-        # Read data into queue
+        eval_processes = []
+        for gpu in worker_gpus:
+            consume_reserved = gpu == reserved_gpu
+            process = Process(
+                target=partial(
+                    eval_worker_process_multi_turn,
+                    self.eval_queue,
+                    self.reserved_queue,
+                    self.reply_queue,
+                    self.done_queue,
+                    self.remote_eval_server_url,
+                    self.eval_semaphore,
+                    gpu,
+                    reserved_gpu,
+                    consume_reserved,
+                ),
+            )
+            process.start()
+            eval_processes.append(process)
+
         from slime_plugins.rollout_buffer.generator.kernel_generator import read_data_into_queue
 
         reader_process = Process(
@@ -669,25 +872,61 @@ class MultiTurnKernelGenerator(BaseGenerator):
                 self.num_repeats,
                 self.num_repeat_per_sample,
                 self.task_queue,
-                self.num_process,
+                num_gen,
             ),
         )
         reader_process.start()
 
-        # Process results
         progress_bar = tqdm(desc="Multi-turn rollout")
-        num_finished = 0
-        while num_finished < self.num_process:
+        gen_done = 0
+        borrowable_done = 0
+        reserved_done = 0
+        borrowable_stops_sent = False
+        reserved_stop_sent = False
+
+        # Same shutdown order as single-turn:
+        # 1) all gens done → STOP × borrowable on eval_queue
+        # 2) all borrowable evals done → STOP on reserved_queue
+        # 3) reserved eval done
+        while True:
+            if has_reserved_worker:
+                finished = (
+                    gen_done >= num_gen
+                    and borrowable_done >= num_borrowable
+                    and reserved_done >= 1
+                )
+            else:
+                finished = gen_done >= num_gen and borrowable_done >= num_eval
+            if finished:
+                break
+
             item = self.done_queue.get()
-            if item == "COMPLETE":
-                num_finished += 1
+            if item == "GEN_COMPLETE":
+                gen_done += 1
+                if gen_done >= num_gen and not borrowable_stops_sent:
+                    n_stop = num_borrowable if has_reserved_worker else num_eval
+                    for _ in range(n_stop):
+                        self.eval_queue.put("STOP")
+                    borrowable_stops_sent = True
+                    logger.info(f"All {num_gen} gens done; sent {n_stop} STOP to eval_queue")
+                    if not has_reserved_worker:
+                        reserved_stop_sent = True
+            elif item == "EVAL_COMPLETE":
+                if has_reserved_worker and borrowable_done < num_borrowable:
+                    borrowable_done += 1
+                    if borrowable_done >= num_borrowable and not reserved_stop_sent:
+                        self.reserved_queue.put("STOP")
+                        reserved_stop_sent = True
+                        logger.info("All borrowable evals done; STOP reserved_queue")
+                elif has_reserved_worker:
+                    reserved_done += 1
+                else:
+                    borrowable_done += 1
             else:
                 assert "reward" in item, f"reward not in item: {item}"
                 assert "instance_id" in item, f"instance_id not in item: {item}"
                 self.send_data_to_buffer(item)
                 progress_bar.update(1)
-
-                # Log multi-turn statistics
                 if "multi_turn_data" in item:
                     mt_data = item["multi_turn_data"]
                     logger.info(
@@ -699,8 +938,9 @@ class MultiTurnKernelGenerator(BaseGenerator):
 
         progress_bar.close()
 
-        # Wait for all processes to complete
-        for process in processes:
+        for process in gen_processes:
+            process.join()
+        for process in eval_processes:
             process.join()
         reader_process.join()
 

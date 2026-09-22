@@ -165,22 +165,25 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
+    # Skip entropy when coef==0: avoids an extra full-vocab logits.clone() that OOMs on long seqs.
+    need_entropy = float(getattr(args, "entropy_coef", 0) or 0) != 0.0
     log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=need_entropy,
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
-    entropy = log_probs_and_entropy["entropy"]
-
     log_probs = torch.cat(log_probs, dim=0)
-    entropy = torch.cat(entropy, dim=0)
 
-    entropy_loss = sum_of_sample_mean(entropy)
+    if need_entropy:
+        entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = torch.zeros((), device=log_probs.device, dtype=log_probs.dtype)
 
     pg_loss, pg_clipfrac, ppo_kl = compute_policy_loss(
         log_probs, old_log_probs, advantages, args.eps_clip, args.eps_clip_high
@@ -285,9 +288,18 @@ def loss_function(args, batch, num_microbatches, logits):
         loss * num_microbatches / args.global_batch_size * mpu.get_data_parallel_world_size(with_context_parallel=True)
     )
 
+    # Megatron schedules.py does torch.clamp(num_tokens, min=1); must be a Tensor
+    # (Python int breaks on recent torch). When not calculate_per_token_loss, return 1
+    # so the Megatron divide is a no-op (loss already scaled by global_batch_size).
+    num_tokens_tensor = torch.tensor(
+        num_tokens if args.calculate_per_token_loss else 1,
+        dtype=torch.int,
+        device=logits.device,
+    )
+
     return (
         loss,
-        num_tokens if args.calculate_per_token_loss else 1,
+        num_tokens_tensor,
         {
             "keys": list(log.keys()),
             "values": torch.tensor(

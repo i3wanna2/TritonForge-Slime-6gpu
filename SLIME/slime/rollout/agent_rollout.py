@@ -187,6 +187,23 @@ def start_rollout(api_base_url: str, args, metadata):
     url = f"{api_base_url}/start_rollout"
     print(f"metadata: {metadata}")
     finished_groups_instance_id_list = [item for sublist in metadata.values() for item in sublist]
+    # After a full pass, saved metadata can list every prompt. Skipping them all
+    # empties the generator queue (0it forever). Keep skip only for partial resume.
+    skip_ids = finished_groups_instance_id_list
+    try:
+        import json as _json
+
+        with open(args.prompt_data, "r") as _f:
+            dataset_ids = {_json.loads(line)["instance_id"] for line in _f if line.strip()}
+        uniq_skip = set(skip_ids)
+        if dataset_ids and uniq_skip >= dataset_ids:
+            print(
+                f"[start_rollout] skip_instance_ids covers full dataset "
+                f"({len(uniq_skip)}/{len(dataset_ids)}); clearing for multi-epoch resample"
+            )
+            skip_ids = []
+    except Exception as e:
+        print(f"[start_rollout] could not validate skip_instance_ids against dataset: {e}")
     payload = {
         "num_process": str(getattr(args, "rollout_num_process", 100)),
         "num_epoch": str(args.num_epoch or 3),
@@ -202,7 +219,7 @@ def start_rollout(api_base_url: str, args, metadata):
             "top_p": args.rollout_top_p,
         },
         "tokenizer_path": args.hf_checkpoint,
-        "skip_instance_ids": finished_groups_instance_id_list,
+        "skip_instance_ids": skip_ids,
     }
 
     # Add multi-turn parameters if task type is kernelbench_multiturn

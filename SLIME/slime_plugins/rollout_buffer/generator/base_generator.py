@@ -152,11 +152,14 @@ class BaseGenerator:
             print(f"BaseGenerator initialized with {len(self.skip_instance_ids)} instance_ids to skip")
             self.skip_instance_ids = self.skip_instance_ids * self.num_repeat_per_sample
 
+        # Local SGLang must not go through corporate http_proxy (image default).
+        import httpx
+        _http = httpx.Client(trust_env=False, timeout=httpx.Timeout(600.0, connect=30.0))
         if "/v1" in remote_engine_url:
-            self.client = OpenAI(api_key="test", base_url=remote_engine_url)
+            self.client = OpenAI(api_key="test", base_url=remote_engine_url, http_client=_http)
         else:
             remote_engine_url = remote_engine_url.strip("/") + "/v1"
-            self.client = OpenAI(api_key="test", base_url=remote_engine_url)
+            self.client = OpenAI(api_key="test", base_url=remote_engine_url, http_client=_http)
 
     def send_data_to_buffer(self, data):
         if "/buffer/write" not in self.remote_buffer_url:
@@ -166,7 +169,7 @@ class BaseGenerator:
 
         for _ in range(2):
             try:
-                response = requests.post(remote_buffer_url, json=data)
+                response = requests.post(remote_buffer_url, json=data, proxies={"http": None, "https": None}, timeout=60)
                 if response.status_code == 200:
                     break
                 else:

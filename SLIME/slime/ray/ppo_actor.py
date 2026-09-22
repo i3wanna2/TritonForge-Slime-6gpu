@@ -54,10 +54,8 @@ class TrainRayActor(RayActor):
         os.environ["MASTER_PORT"] = str(self.master_port)
         os.environ["WORLD_SIZE"] = str(self._world_size)
         os.environ["RANK"] = str(self._rank)
-        # TODO: currently this doesn't work as ray has already set torch.cuda.device_count().
-        # os.environ.pop("CUDA_VISIBLE_DEVICES", None)
-        # os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
-        os.environ["LOCAL_RANK"] = str(ray.get_gpu_ids()[0])
+        # CVD is ascending physical IDs; bundle order gives slot 0..N-1 (default SLIME layout).
+        os.environ["LOCAL_RANK"] = str(self._rank)
 
     def init(self, args, role, with_ref=False):
         self.args = args
@@ -104,6 +102,15 @@ class TrainRayActor(RayActor):
             self.load_other_checkpoint("old_actor", args.load)
 
         if self.args.offload:
+            # NCCL lazily allocates collective-specific workspace on first use.
+            # If that happens at the end of a long multi-turn backward, the GPU
+            # can be near its activation peak and even a small calloc can fail.
+            # Initialize the optimizer grad-norm all-reduce and the DP+CP
+            # collectives before the model pool is ever slept, while memory is
+            # still unconstrained.
+            # NCCL's persistent workspace is then outside the CuMem "model" pool
+            # and survives later model sleep/wake cycles.
+            self._prewarm_grad_sync_collective()
             # recover to actor in the end.
             self.update_gpu_params_dict(self.weights["actor"])
             self.sleep(("model"))
@@ -126,6 +133,43 @@ class TrainRayActor(RayActor):
 
         Timer().start("train_wait")
         return start_rollout_id
+
+    @torch.no_grad()
+    def _prewarm_grad_sync_collective(self):
+        # Exercise the exact optimizer path that later computes grad norm. Its
+        # all-reduce uses the grad-stats/model-parallel group, which is not the
+        # DP+CP group used by gradient reduce-scatter.
+        self.optimizer.get_grad_norm()
+
+        group = mpu.get_data_parallel_group(with_context_parallel=True)
+        world_size = dist.get_world_size(group=group)
+        if world_size <= 1:
+            torch.cuda.synchronize()
+            print("[actor] NCCL grad-norm all-reduce prewarmed", flush=True)
+            return
+
+        # Also initialize the scalar DP+CP all-reduce used for reduced losses.
+        scalar = torch.zeros(1, device=torch.cuda.current_device(), dtype=torch.float32)
+        dist.all_reduce(scalar, group=group)
+
+        # Initialize DP+CP reduce-scatter with a larger payload so NCCL creates
+        # its persistent channel/workspace state before training.
+        warmup_mib = int(os.environ.get("SLIME_NCCL_PREWARM_MIB", "32"))
+        input_numel = warmup_mib * 1024 * 1024 // torch.tensor([], dtype=torch.float32).element_size()
+        input_numel = ((input_numel + world_size - 1) // world_size) * world_size
+        output_numel = input_numel // world_size
+
+        inp = torch.zeros(input_numel, device=torch.cuda.current_device(), dtype=torch.float32)
+        out = torch.empty(output_numel, device=inp.device, dtype=inp.dtype)
+        dist.reduce_scatter_tensor(out, inp, group=group)
+        torch.cuda.synchronize()
+        print(
+            f"[actor] NCCL grad-norm/all-reduce/reduce-scatter prewarmed group_size={world_size} "
+            f"input_mib={warmup_mib}",
+            flush=True,
+        )
+        del scalar, inp, out
+        clear_memory()
 
     @torch.no_grad()
     def update_cpu_params_dict(self, params_dict):
@@ -668,3 +712,6 @@ class RayTrainGroup:
 
     def async_offload(self):
         return [actor.sleep.remote(("model")) for actor in self._actor_handlers]
+
+    def async_onload(self):
+        return [actor.wake_up.remote(("model")) for actor in self._actor_handlers]

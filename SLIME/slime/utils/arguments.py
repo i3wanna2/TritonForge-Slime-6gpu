@@ -712,6 +712,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="URL for the agent rollout buffer",
             )
             parser.add_argument(
+                "--rollout-num-process",
+                type=int,
+                default=100,
+                help=(
+                    "Number of generate-only rollout buffer workers (passed as num_process). "
+                    "Eval workers are separate: one per EVAL_WORKER_GPUS entry (Scheme A)."
+                ),
+            )
+            parser.add_argument(
                 "--update-weights-interval",
                 type=int,
                 default=1,
@@ -804,8 +813,10 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_agent_rollout_arguments(parser)
         parser = add_custom_megatron_plugins_arguments(parser)
-        # For megatron
-        parser.add_argument("--padded-vocab-size", type=int, default=None)
+        # Megatron already registers --padded-vocab-size; only add if missing
+        # (newer Megatron + slime both defining it raises ArgumentError).
+        if "--padded-vocab-size" not in {a.option_strings[0] for a in parser._actions if a.option_strings}:
+            parser.add_argument("--padded-vocab-size", type=int, default=None)
 
         return parser
 
@@ -989,7 +1000,7 @@ def hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
-        ("rms_norm_eps", "norm_epsilon", equal),
+        ("rms_norm_eps", "layernorm_epsilon", equal),
     ]:
         if hasattr(hf_config, hf_config_name):
             assert compare_fn(getattr(hf_config, hf_config_name), getattr(args, megatron_config_name)), (

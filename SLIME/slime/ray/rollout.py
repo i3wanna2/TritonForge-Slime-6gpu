@@ -28,8 +28,8 @@ class RolloutRayActor(RayActor):
             nccl_port=nccl_port,
         )
 
-        if self.args.offload:
-            # offload the engine to the CPU
+        if self.args.offload and getattr(self.args, "colocate", False):
+            # offload the engine to the CPU (colocate only)
             self.infer_engine.sleep()
 
     def init_process_group(self, master_address, master_port, rank_offset, world_size, group_name, backend):

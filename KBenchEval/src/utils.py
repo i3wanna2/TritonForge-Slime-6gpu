@@ -14,11 +14,24 @@ import os
 import json
 from tqdm import tqdm
 
-# API clients
-from together import Together
-from openai import OpenAI
-import google.generativeai as genai
-import anthropic
+# API clients — optional. Eval (/eval) only needs torch/triton; generation clients
+# are unused in the reward server path. Missing packages must not break eval.
+try:
+    from together import Together
+except ImportError:  # pragma: no cover
+    Together = None  # type: ignore
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None  # type: ignore
+try:
+    import google.generativeai as genai
+except ImportError:  # pragma: no cover
+    genai = None  # type: ignore
+try:
+    import anthropic
+except ImportError:  # pragma: no cover
+    anthropic = None  # type: ignore
 
 # from datasets import load_dataset
 import numpy as np

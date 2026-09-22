@@ -8,7 +8,11 @@ from megatron.core import mpu
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import finalize_model_grads
 from megatron.core.models.gpt import GPTModel
-from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer import (
+    OptimizerConfig,
+    get_megatron_optimizer,
+    get_standard_config_overrides,
+)
 from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.utils import get_model_config
@@ -84,19 +88,25 @@ def setup_model_and_optimizer(
     config.timers = None
 
     if with_optimizer:
+        # Megatron-LM dropped positional no_wd_decay_cond/scale_lr_cond/lr_mult;
+        # those are now expressed via config_overrides (ParamGroupOverride).
+        if no_wd_decay_cond is not None or scale_lr_cond is not None or lr_mult != 1.0:
+            raise NotImplementedError(
+                "Custom no_wd_decay_cond/scale_lr_cond/lr_mult need config_overrides "
+                "under this Megatron; defaults (None/None/1.0) only are supported here."
+            )
         optimizer = get_megatron_optimizer(
             config,
             model,
-            no_wd_decay_cond,
-            scale_lr_cond,
-            lr_mult,
-            use_gloo_process_groups=args.enable_gloo_process_groups,
+            config_overrides=get_standard_config_overrides(config),
+            use_gloo_process_groups=getattr(args, "enable_gloo_process_groups", True),
         )
         opt_param_scheduler = get_optimizer_param_scheduler(args, optimizer)
-        for optimizer in optimizer.chained_optimizers:
-            if not getattr(optimizer, "init_state_fn", None):
+        chained = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+        for _opt in chained:
+            if not getattr(_opt, "init_state_fn", None):
                 continue
-            optimizer.init_state_fn(optimizer.optimizer, optimizer.config)
+            _opt.init_state_fn(_opt.optimizer, _opt.config)
 
     else:
         optimizer, opt_param_scheduler = None, None
@@ -334,7 +344,13 @@ def train_one_step(args, rollout_id, step_id, data_iterator, model, optimizer, o
 
 def should_disable_forward_pre_hook(args):
     """Block forward pre-hook for certain configurations."""
-    return not args.use_custom_fsdp and args.use_distributed_optimizer and args.overlap_param_gather
+    # Megatron versions diverge: some Namespace lack use_custom_fsdp.
+    use_custom_fsdp = getattr(args, "use_custom_fsdp", False)
+    return (
+        not use_custom_fsdp
+        and getattr(args, "use_distributed_optimizer", False)
+        and getattr(args, "overlap_param_gather", False)
+    )
 
 
 def train(rollout_id, model, optimizer, opt_param_scheduler, data_iterator, num_microbatches):

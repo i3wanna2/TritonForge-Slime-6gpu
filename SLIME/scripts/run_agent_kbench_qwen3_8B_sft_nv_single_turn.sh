@@ -1,12 +1,28 @@
 #!/bin/bash
+# tmux launcher for NV single-turn (6-GPU quality layout).
+# GPUs: train 2-5 | infer 6 | eval reserved 7 | untouched 0,1
+# Usage:
+#   bash run_agent_kbench_qwen3_8B_sft_nv_single_turn.sh
+#   TRAIN_MODE=cold bash run_agent_kbench_qwen3_8B_sft_nv_single_turn.sh
+#   bash run_agent_kbench_qwen3_8B_sft_nv_single_turn.sh cold
 
 set -e
 
-# Project root directory - change this if TritonForge is in a different location
-PROJECT_ROOT="/root/TritonForge"
+PROJECT_ROOT="${PROJECT_ROOT:-/data/liuxiaoyan/docker-tritonforge/TritonForge}"
+TF_LOG_DIR="${TF_LOG_DIR:-/data/liuxiaoyan/docker-tritonforge/logs}"
+export TF_LOG_DIR
+export TF_ROLLOUT_DATA_DIR="${TF_ROLLOUT_DATA_DIR:-${TF_LOG_DIR}/rollout_data}"
+export TF_ROLLOUT_PAUSE_FILE="${TF_ROLLOUT_PAUSE_FILE:-/tmp/tf_rollout_pause}"
+export EVAL_SERVER_URL="${EVAL_SERVER_URL:-http://127.0.0.1:18188}"
+export PROJECT_ROOT
 
-# Ensure logs directory exists
-mkdir -p ${PROJECT_ROOT}/SLIME/logs
+if [ "${1:-}" = "resume" ] || [ "${1:-}" = "cold" ] || [ "${1:-}" = "resume_weights" ]; then
+  export TRAIN_MODE="$1"
+fi
+# TP 1→2: default skip optim shards
+export TRAIN_MODE="${TRAIN_MODE:-resume_weights}"
+
+mkdir -p "${TF_LOG_DIR}/train" "${TF_LOG_DIR}/multi_turn" "${TF_ROLLOUT_DATA_DIR}"
 
 SESSION_NAME="slime_qwen3_sft_single_turn_run"
 WINDOW_1="slime"
@@ -18,16 +34,30 @@ if tmux has-session -t $SESSION_NAME 2>/dev/null; then
     tmux kill-session -t $SESSION_NAME
 fi
 
-sleep 5
+sleep 2
+
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY || true
+export NO_PROXY="localhost,127.0.0.1,::1,172.17.0.2,172.17.0.1,0.0.0.0"
+export no_proxy="$NO_PROXY"
+rm -f "${TF_ROLLOUT_PAUSE_FILE}"
 
 tmux new-session -d -s $SESSION_NAME -n $WINDOW_1
 tmux send-keys -t ${SESSION_NAME}:${WINDOW_1} "cd ${PROJECT_ROOT}" C-m
-tmux send-keys -t ${SESSION_NAME}:${WINDOW_1} "bash ./SLIME/scripts/agent-example-kbench-qwen3-8B-sft-nv-single-turn.sh |& tee ${PROJECT_ROOT}/SLIME/logs/slime_qwen3_sft_single_turn_train.log" C-m
+tmux send-keys -t ${SESSION_NAME}:${WINDOW_1} "unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; export TRAIN_MODE=${TRAIN_MODE} TF_LOG_DIR=${TF_LOG_DIR} TF_ROLLOUT_DATA_DIR=${TF_ROLLOUT_DATA_DIR} TF_ROLLOUT_PAUSE_FILE=${TF_ROLLOUT_PAUSE_FILE} EVAL_SERVER_URL=${EVAL_SERVER_URL} PROJECT_ROOT=${PROJECT_ROOT} NO_PROXY='${NO_PROXY}' no_proxy='${no_proxy}'; bash ./SLIME/scripts/agent-example-kbench-qwen3-8B-sft-nv-single-turn.sh |& tee ${TF_LOG_DIR}/train/slime_qwen3_sft_single_turn_train.log" C-m
 
 tmux new-window -t $SESSION_NAME -n $WINDOW_2
-tmux send-keys -t ${SESSION_NAME}:${WINDOW_2} "sleep 30 && cd ${PROJECT_ROOT}/SLIME/slime_plugins/rollout_buffer && python buffer.py |& tee ${PROJECT_ROOT}/SLIME/logs/buffer_qwen3_sft_single_turn.log" C-m
+tmux send-keys -t ${SESSION_NAME}:${WINDOW_2} "sleep 30 && cd ${PROJECT_ROOT}/SLIME/slime_plugins/rollout_buffer && unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && export TF_LOG_DIR=${TF_LOG_DIR} TF_ROLLOUT_DATA_DIR=${TF_ROLLOUT_DATA_DIR} TF_ROLLOUT_PAUSE_FILE=${TF_ROLLOUT_PAUSE_FILE} PROJECT_ROOT=${PROJECT_ROOT} EVAL_WORKER_GPUS=${EVAL_WORKER_GPUS:-2,3,4,5,7} EVAL_RESERVED_DEVICES=${EVAL_RESERVED_DEVICES:-7} EVAL_BORROWABLE_DEVICES=${EVAL_BORROWABLE_DEVICES:-2,3,4,5} EVAL_LARGE_BYTES=${EVAL_LARGE_BYTES:-268435456} PYTHONPATH=${PROJECT_ROOT}/SLIME:/root/Megatron-LM:\${PYTHONPATH:-} NO_PROXY='${NO_PROXY}' no_proxy='${no_proxy}' && python buffer.py |& tee ${TF_LOG_DIR}/train/buffer_qwen3_sft_single_turn.log" C-m
 
 tmux new-window -t $SESSION_NAME -n $WINDOW_3
-tmux send-keys -t ${SESSION_NAME}:${WINDOW_3} "sleep 30 && cd ${PROJECT_ROOT}/KBenchEval && source .venv/bin/activate && CUDA_VISIBLE_DEVICES=6,7 python scripts/eval_server_subprocess.py |& tee ${PROJECT_ROOT}/SLIME/logs/eval_server_qwen3_sft_single_turn.log" C-m
+# Eval CVD excludes infer GPU 6. Reserved=7, borrowable=2-5. OOM→507, client reserved_queue.
+tmux send-keys -t ${SESSION_NAME}:${WINDOW_3} "sleep 20 && cd ${PROJECT_ROOT}/KBenchEval && unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY && export NO_PROXY='${NO_PROXY}' no_proxy='${no_proxy}' EVAL_RESERVED_DEVICES=7 EVAL_BORROWABLE_DEVICES=2,3,4,5 EVAL_PHYSICAL_IDS=1 EVAL_LARGE_BYTES=${EVAL_LARGE_BYTES:-268435456} EVAL_TIMEOUT_S=${EVAL_TIMEOUT_S:-600} EVAL_DRAIN_VRAM_MAX_MIB=${EVAL_DRAIN_VRAM_MAX_MIB:-12288} && CUDA_VISIBLE_DEVICES=2,3,4,5,7 ${PROJECT_ROOT}/KBenchEval/.venv/bin/python scripts/eval_server_subprocess.py |& tee ${TF_LOG_DIR}/train/eval_server_qwen3_sft_single_turn.log" C-m
 
-tmux attach-session -t $SESSION_NAME
+echo "TRAIN_MODE=${TRAIN_MODE}"
+echo "GPUs (physical): actor=2,3,4,5 | rollout=6 | eval=2,3,4,5,7 (Scheme A) | untouched=0,1"
+echo "Train order: pause → wait_idle (kernels returned) → borrow disable → Megatron"
+echo "Logs under: ${TF_LOG_DIR}/train/"
+if [ "${ATTACH:-0}" = "1" ]; then
+  tmux attach-session -t $SESSION_NAME
+else
+  echo "tmux session ${SESSION_NAME} running detached. Attach with: tmux attach -t ${SESSION_NAME}"
+fi

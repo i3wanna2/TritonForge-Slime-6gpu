@@ -15,6 +15,24 @@ class MultiTurnLossMaskGenerator:
             self.system_message_length = 0
             self.gen_token_length = 0
 
+    def _apply_chat_template_ids(self, messages, **kwargs) -> List[int]:
+        """Return a flat list of token ids.
+
+        Newer transformers may return BatchEncoding when tokenize=True; that
+        breaks extend()/torch.tensor with ValueError: too many dimensions 'str'.
+        """
+        kwargs.setdefault("tokenize", True)
+        kwargs.setdefault("return_dict", False)
+        ids = self.tokenizer.apply_chat_template(messages, **kwargs)
+        if hasattr(ids, "input_ids"):
+            ids = ids["input_ids"]
+        if isinstance(ids, dict) and "input_ids" in ids:
+            ids = ids["input_ids"]
+        # batched -> take first sequence
+        if ids and isinstance(ids[0], (list, tuple)):
+            ids = ids[0]
+        return list(ids)
+
     def get_response_lengths(self, loss_masks: List[List[int]]) -> List[int]:
         return [len(mask[mask.index(1) :]) if 1 in mask else 0 for mask in loss_masks]
 
@@ -40,8 +58,8 @@ class MultiTurnLossMaskGenerator:
         idx_1, idx_2 = self.find_all_sublist_indices(chat_template_token_ids, raw_token_ids)
         end_interval = len(chat_template_token_ids) - len(raw_token_ids) - idx_2
         gen_token_length = len(
-            self.tokenizer.apply_chat_template(
-                test_messages, add_special_tokens=False, tokenize=True, add_generation_prompt=True
+            self._apply_chat_template_ids(
+                test_messages, add_special_tokens=False, add_generation_prompt=True
             )
         ) - len(chat_template_token_ids)
 
@@ -53,7 +71,7 @@ class MultiTurnLossMaskGenerator:
         all_token_ids = []
 
         for i, message in enumerate(messages):
-            message_ids = self.tokenizer.apply_chat_template([message], tokenize=True)
+            message_ids = self._apply_chat_template_ids([message])
 
             if message["role"] != "system" and i > 0:
                 message_ids = message_ids[self.system_message_length :]

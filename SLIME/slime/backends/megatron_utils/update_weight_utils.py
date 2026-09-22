@@ -27,7 +27,11 @@ def all_gather_param(name, param):
     param_partitions = [torch.empty_like(param.data) for _ in range(tp_size)]
     dist.all_gather(param_partitions, param.data, group=tp_group)
     partition_dim = param.partition_dim
-    assert param.partition_stride == 1, "partition_stride != 1 is not supported"
+    # Newer Megatron sets partition_stride=2 on gated/SwiGLU fc1 weights.
+    # The linear_fc1 reorder below already reconstructs full [gate|up] correctly.
+    stride = getattr(param, "partition_stride", 1)
+    if stride != 1 and not ("linear_fc1.weight" in name and stride == 2):
+        raise AssertionError(f"partition_stride={stride} != 1 is not supported for {name}")
     # TODO: here we did an extra copy during concat, maybe merge this with convert_to_hf is better?
     # TODO: check only GLU is used.
     if "linear_fc1.weight" in name:

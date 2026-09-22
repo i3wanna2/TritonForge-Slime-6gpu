@@ -106,9 +106,14 @@ def add_sglang_arguments(parser):
 def validate_args(args):
     # sglang
     args.sglang_tp_size = args.rollout_num_gpus_per_engine
-    args.sglang_dp_size = args.sglang_data_parallel_size
-    args.sglang_pp_size = args.sglang_pipeline_parallel_size
-    args.sglang_ep_size = args.sglang_expert_parallel_size
+    # Newer SGLang CLI dests are dp_size/pp_size/ep_size (prefixed -> sglang_dp_size etc.).
+    # Older slime expected sglang_data_parallel_size / pipeline / expert names.
+    if not hasattr(args, "sglang_dp_size"):
+        args.sglang_dp_size = getattr(args, "sglang_data_parallel_size", 1)
+    if not hasattr(args, "sglang_pp_size"):
+        args.sglang_pp_size = getattr(args, "sglang_pipeline_parallel_size", 1)
+    if not hasattr(args, "sglang_ep_size"):
+        args.sglang_ep_size = getattr(args, "sglang_expert_parallel_size", 1)
 
     if args.sglang_dp_size > 1:
         assert args.sglang_enable_dp_attention

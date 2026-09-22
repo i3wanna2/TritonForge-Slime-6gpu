@@ -1,4 +1,55 @@
-CLAUDE.md
+# ---- Fork: never commit weights / logs / local run artifacts ----
+models/
+**/models/Qwen*/
+logs/
+../logs/
+*.log
+*.out
+*.pkl
+*.pt
+*.pth
+*.safetensors
+*.distcp
+*.bin
+*.onnx
+*.ckpt
+
+# WandB / Ray / training dumps
 wandb/
+outputs/
+local/
+**/rollout_data/
+**/buffer_stats/
+**/multi_turn_logs/
+**/kernel_rollout_logs/
+**/eval_artifacts/
+
+# Python / envs
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+CLAUDE.md
+
+# Upstream local ignores
 KBenchEval/.venv/
 SLIME/.github/
+cc_doc/
+cc_data/
+cc_script/

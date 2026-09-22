@@ -69,26 +69,34 @@ def _initialize_distributed(args, get_embedding_ranks=None, get_position_embeddi
 
     # Set the tensor model-parallel, pipeline model-parallel, and
     # data-parallel communicators.
-    mpu.initialize_model_parallel(
-        args.tensor_model_parallel_size,
-        args.pipeline_model_parallel_size,
-        args.virtual_pipeline_model_parallel_size,
-        args.pipeline_model_parallel_split_rank,
-        pipeline_model_parallel_comm_backend=args.pipeline_model_parallel_comm_backend,
-        context_parallel_size=args.context_parallel_size,
-        hierarchical_context_parallel_sizes=args.hierarchical_context_parallel_sizes,
-        expert_model_parallel_size=args.expert_model_parallel_size,
-        num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
-        expert_tensor_parallel_size=args.expert_tensor_parallel_size,
-        distributed_timeout_minutes=args.distributed_timeout_minutes,
-        nccl_communicator_config_path=args.nccl_communicator_config_path,
-        order="tp-cp-ep-dp-pp" if not args.use_tp_pp_dp_mapping else "tp-cp-ep-pp-dp",
-        encoder_tensor_model_parallel_size=args.encoder_tensor_model_parallel_size,
-        encoder_pipeline_model_parallel_size=args.encoder_pipeline_model_parallel_size,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-        create_gloo_process_groups=args.enable_gloo_process_groups,
-    )
+    # Newer Megatron dropped pipeline_model_parallel_split_rank / encoder_* kwargs;
+    # call by keyword and only pass attributes that exist on both sides.
+    mpu_kwargs = {
+        "tensor_model_parallel_size": args.tensor_model_parallel_size,
+        "pipeline_model_parallel_size": args.pipeline_model_parallel_size,
+        "virtual_pipeline_model_parallel_size": getattr(
+            args, "virtual_pipeline_model_parallel_size", None
+        ),
+        "pipeline_model_parallel_comm_backend": getattr(
+            args, "pipeline_model_parallel_comm_backend", None
+        ),
+        "context_parallel_size": args.context_parallel_size,
+        "hierarchical_context_parallel_sizes": getattr(
+            args, "hierarchical_context_parallel_sizes", None
+        ),
+        "expert_model_parallel_size": args.expert_model_parallel_size,
+        "num_distributed_optimizer_instances": getattr(
+            args, "num_distributed_optimizer_instances", 1
+        ),
+        "expert_tensor_parallel_size": getattr(args, "expert_tensor_parallel_size", None),
+        "distributed_timeout_minutes": getattr(args, "distributed_timeout_minutes", 30),
+        "nccl_communicator_config_path": getattr(args, "nccl_communicator_config_path", None),
+        "order": "tp-cp-ep-dp-pp" if not getattr(args, "use_tp_pp_dp_mapping", False) else "tp-cp-ep-pp-dp",
+        "get_embedding_ranks": get_embedding_ranks,
+        "get_position_embedding_ranks": get_position_embedding_ranks,
+        "create_gloo_process_groups": getattr(args, "enable_gloo_process_groups", True),
+    }
+    mpu.initialize_model_parallel(**mpu_kwargs)
 
 
 def init(args):
@@ -128,24 +136,33 @@ def init(args):
         and mpu.get_tensor_model_parallel_rank() == 0
         and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
     ):
-        if args.wandb_key is not None:
+        wandb_mode = os.environ.get("WANDB_MODE", "offline")
+        # Offline / disabled: skip login (wandb 0.29 raises UsageError otherwise).
+        if wandb_mode not in ("offline", "disabled") and args.wandb_key is not None:
             wandb.login(key=args.wandb_key, host=args.wandb_host)
         # add random 6 length string with characters
         if args.wandb_random_suffix:
-            group = args.wandb_group + "_" + wandb.util.generate_id()
+            import secrets
+
+            suffix = secrets.token_hex(4)
+            group = args.wandb_group + "_" + suffix
             run_name = f"{group}-RANK_{args.rank}"
         else:
             group = args.wandb_group
             run_name = args.wandb_group
 
-        wandb.init(
+        init_kwargs = dict(
             entity=args.wandb_team,
             project=args.wandb_project,
             group=group,
             name=run_name,
             config=args.__dict__,
-            settings=wandb.Settings(mode="shared", x_primary=True),
         )
+        if wandb_mode in ("offline", "disabled"):
+            init_kwargs["mode"] = wandb_mode
+        else:
+            init_kwargs["settings"] = wandb.Settings(mode="shared", x_primary=True)
+        wandb.init(**init_kwargs)
 
         wandb.define_metric("train/step")
         wandb.define_metric("train/*", step_metric="train/step")

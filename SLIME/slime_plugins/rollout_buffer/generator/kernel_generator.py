@@ -9,9 +9,9 @@ import uuid
 import warnings
 from functools import partial
 from multiprocessing import Process, Queue, Semaphore
+from queue import Empty
 from typing import Dict, List, Optional
 
-# from queue import Queue
 import requests
 from openai import OpenAI
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -29,17 +29,97 @@ from slime_plugins.rollout_buffer.generator.triton_ops import TRITON_CORE_OPS
 
 TASK_TYPE = "kernelbench"
 DEFAULT_REMOTE_EVAL_SERVER_URL = "http://localhost:18188"
-EVAL_CONCURRENCY = 2
+# Scheme A: many gen workers + exactly one eval worker per GPU (no GPU token pool).
+EVAL_CONCURRENCY = 5
+EVAL_WORKER_GPUS = [
+    int(x.strip())
+    for x in os.environ.get("EVAL_WORKER_GPUS", "2,3,4,5,7").split(",")
+    if x.strip()
+]
+EVAL_RESERVED_GPU = int(
+    os.environ.get(
+        "EVAL_RESERVED_DEVICES",
+        os.environ.get("EVAL_RESERVED_GPU", "7"),
+    )
+    .split(",")[0]
+    .strip()
+    or "7"
+)
+# Default gen concurrency when --rollout-num-process is unset / small.
+DEFAULT_GEN_NUM_PROCESS = int(os.environ.get("GEN_NUM_PROCESS", "20"))
 SAMPLING_PARAMS = {
     "top_p": 1,
 }
 
-# Path to baseline timing data
-BASELINE_TIMING_PATH = (
-    "/root/TritonForge/KBenchEval/results/timing/H100_together/baseline_time_torch_compile_inductor_default.json"
+# Path to baseline timing data (prefer mounted TritonForge over stale /root symlink)
+_TF_ROOT = os.environ.get(
+    "PROJECT_ROOT",
+    "/data/liuxiaoyan/docker-tritonforge/TritonForge",
 )
+BASELINE_TIMING_PATH = os.path.join(
+    _TF_ROOT,
+    "KBenchEval/results/timing/H100_together/baseline_time_torch_compile_inductor_default.json",
+)
+# When set, workers sleep instead of hammering SGLang/eval during Megatron train.
+ROLLOUT_PAUSE_FILE = os.environ.get("TF_ROLLOUT_PAUSE_FILE", "/tmp/tf_rollout_pause")
+LARGE_SHAPE_BYTES = int(os.environ.get("EVAL_LARGE_BYTES", str(256 * 1024 * 1024)))
 
 logger = logging.getLogger(__name__)
+
+
+def wait_if_rollout_paused(poll_s: float = 2.0):
+    """Block while train holds GPUs so we do not busy-spin on dead SGLang."""
+    warned = False
+    while os.path.exists(ROLLOUT_PAUSE_FILE):
+        if not warned:
+            logger.info(f"Rollout paused ({ROLLOUT_PAUSE_FILE}); waiting for train to finish")
+            warned = True
+        time.sleep(poll_s)
+
+
+def estimate_label_bytes(label: str) -> int:
+    """Rough activation footprint from KernelBench label constants + get_inputs.
+
+    Used only for scheduling (large → reserved-first). Not a hard OOM predictor.
+    """
+    if not label:
+        return 0
+    consts: Dict[str, int] = {}
+    for m in re.finditer(
+        r"^(?P<name>[A-Za-z_][\w]*)\s*=\s*(?P<val>\d+)\s*(?:#.*)?$",
+        label,
+        flags=re.M,
+    ):
+        consts[m.group("name")] = int(m.group("val"))
+
+    def _resolve(tok: str) -> Optional[int]:
+        tok = tok.strip()
+        if tok.isdigit():
+            return int(tok)
+        return consts.get(tok)
+
+    total = 0
+    # torch.randn(a, b, c, ...)
+    for m in re.finditer(r"torch\.randn\(\s*([^)]+)\)", label):
+        dims = []
+        ok = True
+        for part in m.group(1).split(","):
+            part = part.strip().split("=")[-1].strip()
+            v = _resolve(part)
+            if v is None:
+                ok = False
+                break
+            dims.append(v)
+        if ok and dims:
+            numel = 1
+            for d in dims:
+                numel *= max(d, 1)
+            total += numel * 4  # fp32 bytes
+
+    # Heuristic: ref + custom + workspace
+    if total > 0:
+        total = int(total * 6)
+    return total
 
 
 def load_baseline_timings() -> Dict[str, Dict[str, Dict]]:
@@ -181,6 +261,7 @@ def submit_kernel_eval_request(
     backend: str = "triton",
     max_retry: int = 3,
     baseline_timings: Optional[Dict] = None,
+    preferred_device: Optional[int] = None,
 ) -> KernelEvalResult:
     original_model_src = item["label"]
     messages = item["messages"]
@@ -215,36 +296,62 @@ def submit_kernel_eval_request(
         "num_perf_trials": 100,
         "measure_performance": True,
         "backend": backend,
-        "verbose": False,  # Default verbose setting
-        "seed": 42,
+        "verbose": False,
+        "seed_num": 42,
     }
+    if preferred_device is not None:
+        payload["preferred_device"] = int(preferred_device)
+    est = estimate_label_bytes(original_model_src)
+    payload["estimated_bytes"] = est
+    # Large / OOM→reserved routing is client-side (reserved_queue), not server hop.
+
     res = None
     with semaphore:
-        for _ in range(max_retry):
+        for attempt in range(max_retry):
+            wait_if_rollout_paused()
             try:
                 response = requests.post(
                     f"{eval_server_url}/eval",
                     json=payload,
+                    proxies={"http": None, "https": None},
+                    timeout=600,
                 )
+                if response.status_code == 503:
+                    logger.warning(f"Eval 503 (no GPU); retry {attempt + 1}/{max_retry}")
+                    time.sleep(min(5 * (attempt + 1), 20))
+                    continue
+                if response.status_code == 507:
+                    # CUDA OOM on pinned GPU — caller requeues to reserved_queue.
+                    detail = {}
+                    try:
+                        body = response.json()
+                        detail = body.get("detail", body) if isinstance(body, dict) else {}
+                    except Exception:
+                        detail = {"error": response.text[:500]}
+                    if not isinstance(detail, dict):
+                        detail = {"error": str(detail)}
+                    return KernelEvalResult(
+                        eval_status="cuda_oom",
+                        eval_response=str(detail.get("error") or detail),
+                        completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        reward=0.0,
+                        exec_result=KernelExecResult(),
+                    )
                 if response.status_code == 200:
                     exec_result = KernelExecResult.model_validate(response.json())
-                    reward, response = 0.0, "Current implementation con't pass compile check"
+                    reward, response_msg = 0.0, "Current implementation con't pass compile check"
                     if exec_result.compiled:
-                        # Use config for rewards
                         reward = KERNELBENCH_REWARDS["compilation"]
                         if exec_result.correctness:
                             reward = KERNELBENCH_REWARDS["correctness"]
-                            response = "Current implementation passes correctness check"
+                            response_msg = "Current implementation passes correctness check"
 
-                            # Add performance reward if runtime is available
                             if exec_result.runtime > 0 and baseline_timings:
-                                # Extract problem info from item
                                 extra_info = item.get("extra_info", {})
                                 level = extra_info.get("level", None)
                                 problem_name = extra_info.get("problem_name", "")
                                 problem_id = extra_info.get("problem_id", None)
 
-                                # Construct the filename to match baseline format: "{problem_id}_{problem_name}.py"
                                 if problem_id is not None and problem_name:
                                     baseline_key = f"{problem_id}_{problem_name}.py"
                                 elif problem_name:
@@ -255,14 +362,13 @@ def submit_kernel_eval_request(
                                 if baseline_key:
                                     baseline_runtime = get_baseline_runtime(level, baseline_key, baseline_timings)
                                     if baseline_runtime and baseline_runtime > 0:
-                                        # Calculate speedup: baseline_time / generated_time
                                         speedup = baseline_runtime / exec_result.runtime
-                                        # Add performance reward based on speedup
-                                        # Speedup of 1.0 = no improvement, 2.0 = 2x faster
-                                        # Cap the performance reward at 2.0 for 3x speedup or better
                                         performance_reward = min(max(speedup - 1.0, 0.0), 2.0)
                                         reward += performance_reward
-                                        response += f" (Speedup: {speedup:.2f}x, Runtime: {exec_result.runtime:.3f}ms vs Baseline: {baseline_runtime:.3f}ms)"
+                                        response_msg += (
+                                            f" (Speedup: {speedup:.2f}x, Runtime: {exec_result.runtime:.3f}ms "
+                                            f"vs Baseline: {baseline_runtime:.3f}ms)"
+                                        )
                                         logger.info(
                                             f"Performance reward: {performance_reward:.3f} for speedup {speedup:.2f}x"
                                         )
@@ -273,24 +379,35 @@ def submit_kernel_eval_request(
                                 else:
                                     logger.warning(f"Could not construct baseline key from extra_info: {extra_info}")
                         else:
-                            response = "Current implementation passes compile check but fails correctness check"
+                            response_msg = "Current implementation passes compile check but fails correctness check"
                     res = KernelEvalResult(
                         eval_status="completed",
-                        eval_response=response,
+                        eval_response=response_msg,
                         completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
                         reward=reward,
                         exec_result=exec_result,
                     )
+                    break
+                logger.error(f"Eval HTTP {response.status_code}: {response.text[:500]}")
             except Exception as e:
-                logger.error(f"Error submitting kernel eval request: {e}, response: {response.text}")
-                return KernelEvalResult(
-                    eval_status="failed",
-                    eval_response=str(e),
-                    completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-                    reward=0.0,
-                    exec_result=KernelExecResult(),
-                )
-
+                logger.error(f"Error submitting kernel eval request: {e}")
+                if attempt + 1 >= max_retry:
+                    return KernelEvalResult(
+                        eval_status="failed",
+                        eval_response=str(e),
+                        completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+                        reward=0.0,
+                        exec_result=KernelExecResult(),
+                    )
+                time.sleep(2)
+    if res is None:
+        return KernelEvalResult(
+            eval_status="failed",
+            eval_response="eval failed after retries",
+            completed_at=time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            reward=0.0,
+            exec_result=KernelExecResult(),
+        )
     return res
 
 
@@ -348,82 +465,168 @@ def rollout_one_trajectory(
     return messages
 
 
-def worker_process(
+def _build_output_item(
+    item: dict,
+    messages: List[dict],
+    eval_result: KernelEvalResult,
+    sampling_params: dict,
+    baseline_timings,
+    preferred_device: Optional[int],
+) -> dict:
+    reward = eval_result.reward if hasattr(eval_result, "reward") else 0.0
+    item["rollout_index"] = item.get("rollout_index", 1)
+    item["reward"] = reward
+
+    execution_details = {}
+    if hasattr(eval_result, "exec_result") and eval_result.exec_result:
+        exec_result = eval_result.exec_result
+        execution_details["compiled"] = exec_result.compiled
+        execution_details["correctness"] = exec_result.correctness
+        execution_details["runtime"] = exec_result.runtime
+        execution_details["runtime_stats"] = exec_result.runtime_stats
+
+        if exec_result.runtime > 0 and baseline_timings:
+            extra_info = item.get("extra_info", {})
+            level = extra_info.get("level", None)
+            problem_name = extra_info.get("problem_name", "")
+            problem_id = extra_info.get("problem_id", None)
+
+            if problem_id is not None and problem_name:
+                baseline_key = f"{problem_id}_{problem_name}.py"
+            elif problem_name:
+                baseline_key = problem_name + ".py"
+            else:
+                baseline_key = None
+
+            if baseline_key:
+                baseline_runtime = get_baseline_runtime(level, baseline_key, baseline_timings)
+                if baseline_runtime and baseline_runtime > 0:
+                    speedup = baseline_runtime / exec_result.runtime
+                    execution_details["speedup"] = speedup
+                    execution_details["baseline_runtime"] = baseline_runtime
+                    execution_details["performance_reward"] = min(max(speedup - 1.0, 0.0), 2.0)
+
+    if hasattr(eval_result, "eval_status"):
+        execution_details["eval_status"] = eval_result.eval_status
+    if hasattr(eval_result, "eval_response"):
+        execution_details["eval_response"] = eval_result.eval_response
+    if preferred_device is not None:
+        execution_details["eval_gpu"] = preferred_device
+
+    original_extra_info = item.get("extra_info", {})
+    item.update(sampling_params)
+    item["timestamp"] = str(time.time())
+    item["round_number"] = len([_ for _ in item["messages"] if _["role"] == "assistant"])
+
+    return {
+        "uid": item.pop("uid"),
+        "messages": messages,
+        "reward": reward,
+        "instance_id": item.pop("instance_id"),
+        "extra_info": {**original_extra_info, **item},
+        "execution_details": execution_details,
+    }
+
+
+def gen_worker_process(
     task_queue,
+    eval_queue,
+    reserved_queue,
     done_queue,
     rollout_func,
-    reward_func,
     client,
     sampling_params,
     remote_eval_server_url,
     eval_semaphore,
-    baseline_timings,
 ):
+    """Generate-only worker: LLM → route to eval_queue or reserved_queue (large shapes)."""
+    logger.info("Gen worker started")
     while True:
+        wait_if_rollout_paused()
         item = task_queue.get()
         if item == "STOP":
             break
+        wait_if_rollout_paused()
         messages = rollout_func(item, client, sampling_params, remote_eval_server_url, eval_semaphore)
         item["messages"] = messages
-        eval_result = reward_func(eval_semaphore, remote_eval_server_url, item, baseline_timings=baseline_timings)
-        reward = eval_result.reward if hasattr(eval_result, "reward") else 0.0
-        item["rollout_index"] = 1
-        item["reward"] = reward
+        wait_if_rollout_paused()  # do not enqueue eval work while Megatron trains
+        est = estimate_label_bytes(item.get("label", "") or "")
+        if est >= LARGE_SHAPE_BYTES:
+            logger.info(f"Large-shape gen est_bytes={est}; route reserved_queue")
+            reserved_queue.put(item)
+        else:
+            eval_queue.put(item)
+    done_queue.put("GEN_COMPLETE")
 
-        # Extract execution details from eval_result
-        execution_details = {}
-        if hasattr(eval_result, "exec_result") and eval_result.exec_result:
-            exec_result = eval_result.exec_result
-            execution_details["compiled"] = exec_result.compiled
-            execution_details["correctness"] = exec_result.correctness
-            execution_details["runtime"] = exec_result.runtime
-            execution_details["runtime_stats"] = exec_result.runtime_stats
 
-            # Calculate speedup if baseline is available
-            if exec_result.runtime > 0 and baseline_timings:
-                extra_info = item.get("extra_info", {})
-                level = extra_info.get("level", None)
-                problem_name = extra_info.get("problem_name", "")
-                problem_id = extra_info.get("problem_id", None)
+def eval_worker_process(
+    eval_queue,
+    reserved_queue,
+    done_queue,
+    reward_func,
+    sampling_params,
+    remote_eval_server_url,
+    eval_semaphore,
+    baseline_timings,
+    preferred_device: int,
+    reserved_gpu: int,
+    consume_reserved: bool,
+):
+    """Eval-only worker pinned to one physical GPU. Reserved worker prefers reserved_queue."""
+    logger.info(
+        f"Eval worker started preferred_device={preferred_device} "
+        f"consume_reserved={consume_reserved} reserved_gpu={reserved_gpu}"
+    )
+    while True:
+        wait_if_rollout_paused()
+        item = None
+        from_reserved = False
+        if consume_reserved:
+            try:
+                item = reserved_queue.get_nowait()
+                from_reserved = True
+            except Empty:
+                try:
+                    item = eval_queue.get(timeout=0.2)
+                except Empty:
+                    continue
+        else:
+            item = eval_queue.get()
 
-                if problem_id is not None and problem_name:
-                    baseline_key = f"{problem_id}_{problem_name}.py"
-                elif problem_name:
-                    baseline_key = problem_name + ".py"
-                else:
-                    baseline_key = None
+        if item == "STOP":
+            # Reserved worker only exits on reserved_queue STOP; put borrowable pills back.
+            if consume_reserved and not from_reserved:
+                eval_queue.put(item)
+                time.sleep(0.05)
+                continue
+            break
 
-                if baseline_key:
-                    baseline_runtime = get_baseline_runtime(level, baseline_key, baseline_timings)
-                    if baseline_runtime and baseline_runtime > 0:
-                        speedup = baseline_runtime / exec_result.runtime
-                        execution_details["speedup"] = speedup
-                        execution_details["baseline_runtime"] = baseline_runtime
-                        execution_details["performance_reward"] = min(max(speedup - 1.0, 0.0), 2.0)
+        wait_if_rollout_paused()
+        eval_result = reward_func(
+            eval_semaphore,
+            remote_eval_server_url,
+            item,
+            baseline_timings=baseline_timings,
+            preferred_device=preferred_device,
+        )
 
-        # Also include eval status and response for debugging
-        if hasattr(eval_result, "eval_status"):
-            execution_details["eval_status"] = eval_result.eval_status
-        if hasattr(eval_result, "eval_response"):
-            execution_details["eval_response"] = eval_result.eval_response
+        # Borrowable OOM → reserved_queue (插队). Reserved GPU OOM is final.
+        if getattr(eval_result, "eval_status", None) == "cuda_oom":
+            if preferred_device != reserved_gpu and not consume_reserved:
+                logger.warning(
+                    f"CUDA OOM on phys={preferred_device}; requeue reserved_queue"
+                )
+                reserved_queue.put(item)
+                continue
+            logger.error(f"CUDA OOM on reserved phys={preferred_device}; fail sample")
 
-        # Preserve original extra_info if it exists
-        original_extra_info = item.get("extra_info", {})
-        item.update(sampling_params)
-        item["timestamp"] = str(time.time())
-        item["round_number"] = len([_ for _ in item["messages"] if _["role"] == "assistant"])
-
-        output_item = {
-            "uid": item.pop("uid"),
-            "messages": messages,
-            "reward": reward,
-            "instance_id": item.pop("instance_id"),
-            "extra_info": {**original_extra_info, **item},  # Merge original extra_info with other item data
-            "execution_details": execution_details,  # Add execution details
-        }
+        messages = item.get("messages", [])
+        output_item = _build_output_item(
+            item, messages, eval_result, sampling_params, baseline_timings, preferred_device
+        )
         done_queue.put(output_item)
 
-    done_queue.put("COMPLETE")
+    done_queue.put("EVAL_COMPLETE")
 
 
 def read_data_into_queue(
@@ -437,22 +640,32 @@ def read_data_into_queue(
     items = []
     actual_skipped_ids = []
 
-    with open(input_file, "r") as r:
-        for line in r:
-            item = json.loads(line)
-            if skip_instance_ids and item["instance_id"] in skip_instance_ids:
-                actual_skipped_ids.append(item["instance_id"])
-                continue
-            items.append(item)
+    def _load(skip):
+        loaded, skipped = [], []
+        with open(input_file, "r") as r:
+            for line in r:
+                item = json.loads(line)
+                if skip and item["instance_id"] in skip:
+                    skipped.append(item["instance_id"])
+                    continue
+                loaded.append(item)
+        return loaded, skipped
+
+    items, actual_skipped_ids = _load(skip_instance_ids)
+    # Resume metadata can cover the whole dataset after one pass; multi-epoch RL
+    # must wrap and resample. Empty queue => workers exit with 0it forever.
+    if skip_instance_ids and not items:
+        logger.warning(
+            "skip_instance_ids emptied the dataset (%d skipped); clearing skip for multi-epoch resample",
+            len(actual_skipped_ids),
+        )
+        items, actual_skipped_ids = _load(None)
 
     random.shuffle(items)  # shuffle items
     logger.info(f"Read {len(items)} items, skipped {len(actual_skipped_ids)} items")
 
-    if skip_instance_ids and len(actual_skipped_ids) < len(skip_instance_ids):
-        logger.warning(f"Warning: some instance_ids are skipped, but not all")
-        not_skipped_ids = set(skip_instance_ids) ^ set(actual_skipped_ids)
-        logger.warning(f"Instance_ids that should be skipped but weren't: {not_skipped_ids}")
-        raise ValueError(f"Some instance_ids are skipped, but not all")
+    if not items:
+        raise ValueError(f"No items to roll out from {input_file} after skip handling")
 
     for _ in range(num_repeats):
         for item in items:
@@ -469,14 +682,14 @@ def read_data_into_queue(
                     time.sleep(1)
                 task_queue.put(item_repeat)
 
-    # Put STOP signal for each process
+    # Put STOP signal for each gen process
     for _ in range(num_process):
         task_queue.put("STOP")
     logger.info(f"Put {num_process} STOP signals into task_queue")
 
 
 class KernelGenerator(BaseGenerator):
-    """Trajectory generator for KernelBench"""
+    """Trajectory generator for KernelBench (Scheme A: gen pool + pinned eval pool)."""
 
     def __init__(
         self,
@@ -510,14 +723,14 @@ class KernelGenerator(BaseGenerator):
         self.remote_eval_server_url = remote_eval_server_url
         self.eval_concurrency = eval_concurrency
         self.eval_semaphore = Semaphore(eval_concurrency)
-        self.task_queue, self.done_queue = Queue(maxsize=self.queue_size), Queue(maxsize=self.queue_size)
+        self.task_queue = Queue(maxsize=self.queue_size)
+        self.eval_queue = Queue(maxsize=self.queue_size)
+        self.reserved_queue = Queue(maxsize=self.queue_size)
+        self.done_queue = Queue(maxsize=self.queue_size)
 
-        # Initialize sampling_params with global SAMPLING_PARAMS
-        # This will be updated in run_rollout function
         self.sampling_params = SAMPLING_PARAMS.copy()
         self.sampling_params["max_tokens"] = max_tokens
 
-        # Load baseline timings once at initialization
         self.baseline_timings = load_baseline_timings()
         if self.baseline_timings:
             logger.info(f"Loaded baseline timings for {sum(len(v) for v in self.baseline_timings.values())} problems")
@@ -533,24 +746,70 @@ class KernelGenerator(BaseGenerator):
         self.rollout_one_epoch(input_file, rollout_func, reward_func)
 
     def rollout_one_epoch(self, input_file, rollout_func, reward_func):
-        processes = []
-        for _ in range(self.num_process):
+        worker_gpus = list(EVAL_WORKER_GPUS) if EVAL_WORKER_GPUS else []
+        if not worker_gpus:
+            raise ValueError("EVAL_WORKER_GPUS is empty; need pinned eval GPUs")
+
+        reserved_gpu = EVAL_RESERVED_GPU
+        if reserved_gpu not in worker_gpus:
+            logger.warning(
+                f"EVAL_RESERVED_GPU={reserved_gpu} not in EVAL_WORKER_GPUS={worker_gpus}; "
+                f"OOM/large will have no reserved consumer"
+            )
+
+        num_gen = self.num_process
+        num_eval = len(worker_gpus)
+        borrowable_gpus = [g for g in worker_gpus if g != reserved_gpu]
+        # Reserved worker is the one pinned to reserved_gpu (if present).
+        num_borrowable = len(borrowable_gpus)
+        has_reserved_worker = reserved_gpu in worker_gpus
+
+        logger.info(
+            f"Scheme A: gen_workers={num_gen} eval_workers={num_eval} "
+            f"gpus={worker_gpus} reserved={reserved_gpu} "
+            f"borrowable={borrowable_gpus} eval_concurrency={self.eval_concurrency}"
+        )
+
+        gen_processes = []
+        for _ in range(num_gen):
             process = Process(
                 target=partial(
-                    worker_process,
+                    gen_worker_process,
                     self.task_queue,
+                    self.eval_queue,
+                    self.reserved_queue,
                     self.done_queue,
                     rollout_func,
-                    reward_func,
                     self.client,
                     self.sampling_params,
                     self.remote_eval_server_url,
                     self.eval_semaphore,
-                    self.baseline_timings,
                 ),
             )
             process.start()
-            processes.append(process)
+            gen_processes.append(process)
+
+        eval_processes = []
+        for gpu in worker_gpus:
+            consume_reserved = gpu == reserved_gpu
+            process = Process(
+                target=partial(
+                    eval_worker_process,
+                    self.eval_queue,
+                    self.reserved_queue,
+                    self.done_queue,
+                    reward_func,
+                    self.sampling_params,
+                    self.remote_eval_server_url,
+                    self.eval_semaphore,
+                    self.baseline_timings,
+                    gpu,
+                    reserved_gpu,
+                    consume_reserved,
+                ),
+            )
+            process.start()
+            eval_processes.append(process)
 
         reader_process = Process(
             target=read_data_into_queue,
@@ -560,17 +819,58 @@ class KernelGenerator(BaseGenerator):
                 self.num_repeats,
                 self.num_repeat_per_sample,
                 self.task_queue,
-                self.num_process,
+                num_gen,
             ),
         )
         reader_process.start()
 
         progress_bar = tqdm()
-        num_finished = 0
-        while num_finished < self.num_process:
+        gen_done = 0
+        borrowable_done = 0
+        reserved_done = 0
+        borrowable_stops_sent = False
+        reserved_stop_sent = False
+
+        # Collect until all eval workers exit. Shutdown order:
+        # 1) all gens done → STOP × borrowable on eval_queue
+        # 2) all borrowable evals done → STOP on reserved_queue
+        # 3) reserved eval done
+        while True:
+            if has_reserved_worker:
+                finished = (
+                    gen_done >= num_gen
+                    and borrowable_done >= num_borrowable
+                    and reserved_done >= 1
+                )
+            else:
+                finished = gen_done >= num_gen and borrowable_done >= num_eval
+            if finished:
+                break
+
             item = self.done_queue.get()
-            if item == "COMPLETE":
-                num_finished += 1
+            if item == "GEN_COMPLETE":
+                gen_done += 1
+                if gen_done >= num_gen and not borrowable_stops_sent:
+                    n_stop = num_borrowable if has_reserved_worker else num_eval
+                    for _ in range(n_stop):
+                        self.eval_queue.put("STOP")
+                    borrowable_stops_sent = True
+                    logger.info(f"All {num_gen} gens done; sent {n_stop} STOP to eval_queue")
+                    if not has_reserved_worker:
+                        reserved_stop_sent = True
+            elif item == "EVAL_COMPLETE":
+                # Distinguish borrowable vs reserved via order of completion signals only:
+                # borrowable exit first (after their STOPs); then we STOP reserved.
+                if has_reserved_worker and borrowable_done < num_borrowable:
+                    borrowable_done += 1
+                    if borrowable_done >= num_borrowable and not reserved_stop_sent:
+                        self.reserved_queue.put("STOP")
+                        reserved_stop_sent = True
+                        logger.info("All borrowable evals done; STOP reserved_queue")
+                elif has_reserved_worker:
+                    reserved_done += 1
+                else:
+                    borrowable_done += 1
             else:
                 assert "reward" in item, f"reward not in item: {item}"
                 assert "instance_id" in item, f"instance_id not in item: {item}"
@@ -579,8 +879,9 @@ class KernelGenerator(BaseGenerator):
 
         progress_bar.close()
 
-        # Wait for all processes to complete
-        for process in processes:
+        for process in gen_processes:
+            process.join()
+        for process in eval_processes:
             process.join()
         reader_process.join()
 
@@ -600,17 +901,21 @@ def run_rollout(data: dict):
         SAMPLING_PARAMS[k] = v
         logger.info(f"Set {k} to {v}", type(v))
 
+    # num_process = generate workers. Eval workers = len(EVAL_WORKER_GPUS).
+    num_gen = int(data.get("num_process", DEFAULT_GEN_NUM_PROCESS))
+    num_eval = len(EVAL_WORKER_GPUS) or 5
+
     generator = KernelGenerator(
         data["remote_engine_url"],
         data["remote_buffer_url"],
         num_repeat_per_sample=int(data["num_repeat_per_sample"]),
         queue_size=1000000,
         max_tokens=int(data["sampling_params"]["max_tokens"]),
-        num_process=int(data.get("num_process", 100)),
+        num_process=num_gen,
         task_type=data["task_type"],
         skip_instance_ids=data.get("skip_instance_ids", None),
         remote_eval_server_url=data.get("remote_eval_server_url", DEFAULT_REMOTE_EVAL_SERVER_URL),
-        eval_concurrency=int(data.get("eval_concurrency", EVAL_CONCURRENCY)),
+        eval_concurrency=int(data.get("eval_concurrency", min(EVAL_CONCURRENCY, num_eval))),
     )
 
     generator.entry(data["input_file"], rollout_func, reward_func, int(data.get("num_epoch", 1)))

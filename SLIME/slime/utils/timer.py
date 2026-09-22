@@ -13,7 +13,10 @@ class Timer(metaclass=SingletonMeta):
         self.start_time = {}
 
     def start(self, name):
-        assert name not in self.timers, f"Timer {name} already started."
+        # Must check the in-flight map, not accumulated totals — otherwise
+        # repeating @timer methods (e.g. sleep/wake_up across offload cycles)
+        # falsely assert "already started" after the first successful run.
+        assert name not in self.start_time, f"Timer {name} already started."
         self.start_time[name] = time()
 
     def end(self, name):
